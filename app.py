@@ -67,6 +67,7 @@ from datetime import datetime, time as dtime
 
 import requests
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 import upstox_client
@@ -253,6 +254,7 @@ class MarketDataManager:
             "prices": deque(maxlen=CHART_WINDOW),
             "vwaps": deque(maxlen=CHART_WINDOW),
             "emas": deque(maxlen=CHART_WINDOW),
+            "candles": deque(maxlen=400),  # 1-min OHLC bars: {time,open,high,low,close}
             "cum_pv": 0.0,
             "cum_vol": 0.0,
             "last_cum_vol": 0.0,
@@ -301,10 +303,14 @@ class MarketDataManager:
                 vwap = st_["cum_pv"] / st_["cum_vol"] if st_["cum_vol"] else close
                 st_["ema_prev"] = close if st_["ema_prev"] is None else close * k + st_["ema_prev"] * (1 - k)
 
-                st_["times"].append(pd.to_datetime(ts))
+                candle_time = pd.to_datetime(ts)
+                st_["times"].append(candle_time)
                 st_["prices"].append(close)
                 st_["vwaps"].append(vwap)
                 st_["emas"].append(st_["ema_prev"])
+                st_["candles"].append({
+                    "time": candle_time, "open": o, "high": h, "low": l, "close": close,
+                })
 
             st_["last_cum_vol"] = total_vol
             st_["ltp"] = st_["prices"][-1] if st_["prices"] else None
@@ -361,6 +367,17 @@ class MarketDataManager:
             st_["ltp"], st_["vwap"], st_["ema"] = ltp, vwap, ema
             st_["signal"] = self._classify(ltp, vwap, ema)
             st_["last_signal"] = st_["signal"]
+
+            # roll ltp ticks into a live-forming 1-min OHLC candle
+            minute = now.replace(second=0, microsecond=0)
+            candles = st_["candles"]
+            if candles and candles[-1]["time"] == minute:
+                bar = candles[-1]
+                bar["high"] = max(bar["high"], ltp)
+                bar["low"] = min(bar["low"], ltp)
+                bar["close"] = ltp
+            else:
+                candles.append({"time": minute, "open": ltp, "high": ltp, "low": ltp, "close": ltp})
 
     @staticmethod
     def _parse_full_feed(feed):
@@ -422,6 +439,19 @@ class MarketDataManager:
                 for s, v in self.stock_state.items()
             }
 
+    def get_chart_data(self, symbol):
+        with self.state_lock:
+            st_ = self.stock_state.get(symbol)
+            if st_ is None:
+                return None
+            return {
+                "candles": list(st_["candles"]),
+                "times": list(st_["times"]),
+                "vwaps": list(st_["vwaps"]),
+                "emas": list(st_["emas"]),
+                "vwap_mode": st_["vwap_mode"],
+            }
+
 
 @st.cache_resource(show_spinner="Connecting to Upstox & seeding today's data...")
 def get_manager(access_token, symbols_tuple):
@@ -454,6 +484,64 @@ else:
 
 snapshot = manager.snapshot()
 symbols = list(snapshot.keys())
+
+if "selected_symbol" not in st.session_state:
+    st.session_state.selected_symbol = symbols[0] if symbols else None
+
+st.session_state.selected_symbol = st.selectbox(
+    "Chart — 1 minute candles",
+    symbols,
+    index=symbols.index(st.session_state.selected_symbol)
+    if st.session_state.selected_symbol in symbols else 0,
+)
+
+
+def render_stock_chart(manager, symbol):
+    data = manager.get_chart_data(symbol)
+    if not data or not data["candles"]:
+        st.info(f"No candle data yet for {symbol}.")
+        return
+
+    df = pd.DataFrame(data["candles"])
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+        name=symbol, increasing_line_color="#2ecc71", decreasing_line_color="#e74c3c",
+        showlegend=False,
+    ))
+    if data["times"] and data["vwaps"]:
+        fig.add_trace(go.Scatter(
+            x=data["times"], y=data["vwaps"], mode="lines",
+            name=f"VWAP ({data['vwap_mode']})", line=dict(color="#00e5ff", width=1.5),
+        ))
+    if data["times"] and data["emas"]:
+        fig.add_trace(go.Scatter(
+            x=data["times"], y=data["emas"], mode="lines",
+            name="EMA9", line=dict(color="#ffeb3b", width=1.5),
+        ))
+
+    latest_vwap = data["vwaps"][-1] if data["vwaps"] else None
+    latest_ema = data["emas"][-1] if data["emas"] else None
+    subtitle = ""
+    if latest_vwap is not None and latest_ema is not None:
+        subtitle = f" — VWAP {latest_vwap:.2f} | EMA9 {latest_ema:.2f}"
+
+    fig.update_layout(
+        title=f"{symbol}{subtitle}",
+        template="plotly_dark",
+        xaxis_rangeslider_visible=False,
+        height=480,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+if st.session_state.selected_symbol:
+    render_stock_chart(manager, st.session_state.selected_symbol)
+
+st.divider()
+st.caption("Overview grid — click a stock in the dropdown above to see its chart")
 
 for row_start in range(0, len(symbols), GRID_COLS):
     row_symbols = symbols[row_start:row_start + GRID_COLS]
