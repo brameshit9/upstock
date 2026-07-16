@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+upstox_instrument_master.json
+__pycache__/
+*.pyc
+.env
